@@ -13,17 +13,12 @@ import {
   Utensils, 
   Camera, 
   ChevronRight, 
-  X,
-  Plus,
-  Trash2,
   Navigation,
-  ExternalLink,
-  Info
+  ExternalLink
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { SHINSAIBASHI_PLACES, type Place } from './data';
 import { cn } from './lib/utils';
-import { getPlaceReviewSummary } from './services/geminiService';
 
 // --- Google Maps Style Markers ---
 const createCustomIcon = (category: string, isHighlighted: boolean = false) => {
@@ -89,8 +84,22 @@ const formatDistance = (meters: number) => {
   return `${Math.round(meters)} m`;
 };
 
+const inferFoodPreference = (place: Place): string => {
+  if (place.category !== 'food') return 'other';
+  const source = `${place.name} ${place.description}`.toLowerCase();
+  if (source.includes('拉麵')) return 'ramen';
+  if (source.includes('燒肉') || source.includes('和牛') || source.includes('牛')) return 'bbq';
+  if (source.includes('壽司')) return 'sushi';
+  if (source.includes('甜') || source.includes('蛋糕') || source.includes('鬆餅') || source.includes('可麗餅')) return 'dessert';
+  if (source.includes('咖啡') || source.includes('cafe')) return 'coffee';
+  if (source.includes('章魚燒') || source.includes('串炸') || source.includes('小吃') || source.includes('肉包')) return 'street';
+  return 'other';
+};
+
 export default function App() {
   const [activeCategory, setActiveCategory] = useState<string>('all');
+  const [foodPreference, setFoodPreference] = useState<string>('all');
+  const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedPlace, setSelectedPlace] = useState<Place | null>(null);
   const [mapCenter, setMapCenter] = useState<[number, number]>([34.6710, 135.5014]);
@@ -105,14 +114,16 @@ export default function App() {
     return saved ? JSON.parse(saved) : [];
   });
 
-  const [aiSummaries, setAiSummaries] = useState<Record<string, string>>({});
-  const [dismissedReviews, setDismissedReviews] = useState<Set<string>>(new Set());
   const [routeStart, setRouteStart] = useState<Place | null>(null);
   const [routeEnd, setRouteEnd] = useState<Place | null>(null);
   const [routePath, setRoutePath] = useState<[number, number][]>([]);
   const [routeDistance, setRouteDistance] = useState<number | null>(null);
   const [isRouting, setIsRouting] = useState(false);
   const [routeError, setRouteError] = useState('');
+  const [itineraryRoutePath, setItineraryRoutePath] = useState<[number, number][]>([]);
+  const [itineraryRouteDistance, setItineraryRouteDistance] = useState<number | null>(null);
+  const [isItineraryRouting, setIsItineraryRouting] = useState(false);
+  const [itineraryRouteError, setItineraryRouteError] = useState('');
 
   // Function to calculate distance between two coordinates in meters
   const calculateDistance = (lat1: number, lng1: number, lat2: number, lng2: number) => {
@@ -153,11 +164,12 @@ export default function App() {
   const filteredPlaces = useMemo(() => {
     return SHINSAIBASHI_PLACES.filter(place => {
       const matchesCategory = activeCategory === 'all' || place.category === activeCategory;
+      const matchesFoodPreference = activeCategory !== 'food' || foodPreference === 'all' || inferFoodPreference(place) === foodPreference;
       const matchesSearch = place.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
                            place.description.toLowerCase().includes(searchQuery.toLowerCase());
-      return matchesCategory && matchesSearch;
+      return matchesCategory && matchesFoodPreference && matchesSearch;
     });
-  }, [activeCategory, searchQuery]);
+  }, [activeCategory, foodPreference, searchQuery]);
 
   const toggleFavorite = (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
@@ -173,14 +185,9 @@ export default function App() {
     );
   };
 
-  const handlePlaceSelect = async (place: Place) => {
+  const handlePlaceSelect = (place: Place) => {
     setSelectedPlace(place);
     setMapCenter([place.lat, place.lng]);
-    
-    if (!aiSummaries[place.id]) {
-      const summary = await getPlaceReviewSummary(place.name);
-      setAiSummaries(prev => ({ ...prev, [place.id]: summary }));
-    }
   };
 
   const selectRoutePoint = (type: 'start' | 'end', place: Place, e: React.MouseEvent) => {
@@ -242,9 +249,56 @@ export default function App() {
     fetchRoute();
   }, [routeStart, routeEnd]);
 
+  useEffect(() => {
+    const fetchItineraryRoute = async () => {
+      if (itineraryDetails.length < 2) {
+        setItineraryRoutePath([]);
+        setItineraryRouteDistance(null);
+        setItineraryRouteError('');
+        return;
+      }
+
+      setIsItineraryRouting(true);
+      setItineraryRouteError('');
+      try {
+        const points = itineraryDetails.map((p) => `${p.lng},${p.lat}`).join(';');
+        const response = await fetch(
+          `https://router.project-osrm.org/route/v1/walking/${points}?overview=full&geometries=geojson`
+        );
+        if (!response.ok) {
+          throw new Error('Itinerary route API failed');
+        }
+        const data = await response.json();
+        const route = data?.routes?.[0];
+        if (!route?.geometry?.coordinates?.length) {
+          throw new Error('No itinerary route');
+        }
+        const coordinates = route.geometry.coordinates.map(
+          ([lng, lat]: [number, number]) => [lat, lng] as [number, number]
+        );
+        setItineraryRoutePath(coordinates);
+        setItineraryRouteDistance(route.distance ?? null);
+      } catch {
+        const fallbackPath = itineraryDetails.map((p) => [p.lat, p.lng] as [number, number]);
+        const fallbackDistance = itineraryDetails.slice(0, -1).reduce((total, p, idx) => {
+          const next = itineraryDetails[idx + 1];
+          return total + calculateDistance(p.lat, p.lng, next.lat, next.lng);
+        }, 0);
+        setItineraryRoutePath(fallbackPath);
+        setItineraryRouteDistance(fallbackDistance);
+        setItineraryRouteError('多點路網暫時不可用，改用直線估算');
+      } finally {
+        setIsItineraryRouting(false);
+      }
+    };
+
+    fetchItineraryRoute();
+  }, [itineraryDetails]);
+
   return (
-    <div className="flex h-screen bg-[#0A0A0B] font-sans text-[#E2E8F0] overflow-hidden p-4 gap-4">
+    <div className="flex h-screen bg-[#0A0A0B] font-sans text-[#E2E8F0] overflow-hidden p-4 gap-4 relative">
       {/* Sidebar - Control Panel */}
+      {isSidebarOpen && (
       <aside className="w-80 glass-panel rounded-3xl flex flex-col z-50 overflow-hidden shadow-2xl">
         <header className="p-6 border-b border-white/5">
           <div className="flex items-center gap-3 mb-6">
@@ -290,6 +344,36 @@ export default function App() {
               </button>
             ))}
           </div>
+          {activeCategory === 'food' && (
+            <div className="mt-3">
+              <p className="text-[10px] uppercase tracking-widest text-slate-500 font-bold mb-2">想吃什麼</p>
+              <div className="flex gap-2 overflow-x-auto pb-1 scrollbar-hide">
+                {[
+                  { id: 'all', label: '全部' },
+                  { id: 'ramen', label: '拉麵' },
+                  { id: 'bbq', label: '燒肉' },
+                  { id: 'sushi', label: '壽司' },
+                  { id: 'street', label: '小吃' },
+                  { id: 'dessert', label: '甜點' },
+                  { id: 'coffee', label: '咖啡' },
+                  { id: 'other', label: '其他' },
+                ].map((item) => (
+                  <button
+                    key={item.id}
+                    onClick={() => setFoodPreference(item.id)}
+                    className={cn(
+                      "px-2.5 py-1.5 rounded-full text-[10px] font-bold border whitespace-nowrap transition-all",
+                      foodPreference === item.id
+                        ? "bg-[#7C3AED] text-white border-[#7C3AED]"
+                        : "bg-slate-800/30 text-slate-400 border-white/5 hover:bg-slate-700/50 hover:text-white"
+                    )}
+                  >
+                    {item.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
         </header>
 
         <main className="flex-1 overflow-y-auto p-4 space-y-4 custom-scrollbar">
@@ -481,6 +565,7 @@ export default function App() {
           </div>
         </section>
       </aside>
+      )}
 
       {/* Map View */}
       <section className="flex-1 relative glass-panel rounded-3xl overflow-hidden shadow-2xl">
@@ -590,6 +675,12 @@ export default function App() {
               </Popup>
             </Marker>
           ))}
+          {itineraryRoutePath.length >= 2 && (
+            <Polyline
+              positions={itineraryRoutePath}
+              pathOptions={{ color: '#22C55E', weight: 5, opacity: 0.8 }}
+            />
+          )}
           {routePath.length >= 2 && (
             <Polyline
               positions={routePath}
@@ -612,82 +703,6 @@ export default function App() {
           )}
           <MapFocusHandler center={mapCenter} />
         </MapContainer>
-
-        {/* Floating AI Review Badge */}
-        <AnimatePresence>
-          {selectedPlace && aiSummaries[selectedPlace.id] && !dismissedReviews.has(selectedPlace.id) && (
-            <motion.div
-              initial={{ opacity: 0, x: 50, scale: 0.9 }}
-              animate={{ opacity: 1, x: 0, scale: 1 }}
-              exit={{ opacity: 0, x: 50, scale: 0.9 }}
-              className="absolute top-6 right-6 z-[1000] w-72"
-            >
-              <div className="bg-[#0f172a] border border-white/10 rounded-3xl shadow-[0_20px_50px_rgba(0,0,0,0.6)] p-5 backdrop-blur-xl relative overflow-hidden group">
-                <div className="absolute -top-10 -right-10 w-24 h-24 bg-indigo-500/20 rounded-full blur-3xl" />
-                
-                <div className="flex items-center justify-between mb-4">
-                  <div className="flex items-center gap-2">
-                    <div className="w-6 h-6 rounded-lg bg-gradient-to-tr from-indigo-500 to-purple-500 flex items-center justify-center">
-                      <Star className="w-3 h-3 text-white" />
-                    </div>
-                    <span className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">AI 旅客短評</span>
-                  </div>
-                  <button 
-                    onClick={() => {
-                      setDismissedReviews(prev => new Set(prev).add(selectedPlace.id));
-                    }}
-                    className="p-1.5 hover:bg-white/10 rounded-full transition-colors"
-                  >
-                    <X className="w-3.5 h-3.5 text-slate-500" />
-                  </button>
-                </div>
-                
-                <p className="text-sm font-medium leading-relaxed italic text-indigo-100 mb-5 relative z-10">
-                  「{aiSummaries[selectedPlace.id]}」
-                </p>
-                
-                <div className="flex flex-col gap-4">
-                  <div className="flex items-center gap-3 bg-white/5 p-2 rounded-2xl border border-white/5">
-                    <img src={selectedPlace.image} className="w-12 h-12 rounded-xl object-cover border border-white/10" alt="" />
-                    <div className="flex flex-col">
-                      <span className="text-[9px] font-black uppercase tracking-widest text-indigo-400 flex items-center gap-1">
-                        <MapPin className="w-2.5 h-2.5" />
-                        {selectedPlace.category === 'food' ? '美食' : selectedPlace.category === 'shop' ? '商店' : '景點'}
-                      </span>
-                      <span className="text-xs font-bold text-white leading-tight mt-0.5">{selectedPlace.name}</span>
-                    </div>
-                  </div>
-                  
-                  <div className="flex gap-2">
-                    <button 
-                      onClick={(e) => toggleFavorite(selectedPlace.id, e)}
-                      className={cn(
-                        "flex-1 flex items-center justify-center gap-2 py-2.5 rounded-xl text-[10px] font-black uppercase tracking-widest border transition-all",
-                        favorites.includes(selectedPlace.id)
-                          ? "bg-red-500 border-red-500 text-white shadow-[0_4px_15px_rgba(239,68,68,0.4)]"
-                          : "border-white/10 text-slate-300 hover:bg-white/5"
-                      )}
-                    >
-                      <Heart className={cn("w-3.5 h-3.5", favorites.includes(selectedPlace.id) && "fill-current")} />
-                      {favorites.includes(selectedPlace.id) ? "已收藏" : "加入我的足跡"}
-                    </button>
-                    {selectedPlace.website && (
-                      <a 
-                        href={selectedPlace.website} 
-                        target="_blank" 
-                        rel="noopener noreferrer"
-                        className="flex-1 flex items-center justify-center gap-2 py-2.5 rounded-xl text-[10px] font-black uppercase tracking-widest border border-white/10 text-slate-300 hover:bg-white/5 transition-all"
-                      >
-                        <ExternalLink className="w-3.5 h-3.5" />
-                        官方連結
-                      </a>
-                    )}
-                  </div>
-                </div>
-              </div>
-            </motion.div>
-          )}
-        </AnimatePresence>
 
         {/* Special Highlight Info */}
         <div className="absolute bottom-10 left-10 z-[1000] group">
@@ -715,7 +730,7 @@ export default function App() {
         </div>
 
         {/* Categories floating labels */}
-        <div className="absolute top-6 left-6 z-[1000] flex flex-col gap-2">
+        <div className="absolute top-20 left-6 z-[1000] flex flex-col gap-2">
           <div className="glass-panel px-4 py-2 rounded-2xl flex items-center gap-3 text-[10px] font-black uppercase tracking-widest text-slate-300 shadow-xl border-white/5">
             <div className="w-2.5 h-2.5 rounded-full bg-[#EA4335] shadow-[0_0_10px_rgba(234,67,53,0.5)]"></div> 美食探索
           </div>
@@ -726,6 +741,33 @@ export default function App() {
             <div className="w-2.5 h-2.5 rounded-full bg-[#34A853] shadow-[0_0_10px_rgba(52,168,83,0.5)]"></div> 必訪景點
           </div>
         </div>
+
+        <div className="absolute top-6 z-[1000] left-6">
+          <button
+            onClick={() => setIsSidebarOpen((prev) => !prev)}
+            className="glass-panel px-3 py-2 rounded-2xl text-[10px] font-black uppercase tracking-widest text-slate-200 border border-white/10 hover:bg-white/10 transition-all"
+          >
+            {isSidebarOpen ? '收合攻略面板' : '展開攻略面板'}
+          </button>
+        </div>
+
+        {itineraryDetails.length >= 2 && (
+          <div className="absolute top-20 right-6 z-[1000]">
+            <div className="glass-panel px-4 py-3 rounded-2xl border border-white/10 bg-slate-900/75">
+              <p className="text-[10px] font-black uppercase tracking-widest text-emerald-300">多點行程路線</p>
+              <p className="text-xs font-bold text-white mt-1">
+                {isItineraryRouting
+                  ? '計算中...'
+                  : itineraryRouteDistance !== null
+                    ? `總距離：${formatDistance(itineraryRouteDistance)}`
+                    : '尚未取得路線'}
+              </p>
+              {itineraryRouteError && (
+                <p className="text-[10px] text-amber-300 mt-1">{itineraryRouteError}</p>
+              )}
+            </div>
+          </div>
+        )}
 
         {/* Offline Overlay Status */}
         <div className="absolute bottom-4 right-4 z-[10001] pointer-events-none">
